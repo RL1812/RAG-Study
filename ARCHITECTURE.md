@@ -24,8 +24,10 @@ Both services share their settings through `common/config.yaml`.
 flowchart LR
     subgraph Indexing["Offline indexing"]
         PDF[("PDFs<br/>Cloud Storage")] --> PARSE["Parse<br/>Document AI"]
-        PARSE --> CHUNK["Chunk + embed<br/>LlamaIndex · text-embedding-004"]
+        PARSE --> CHUNK["Chunk<br/>LlamaIndex"]
     end
+
+    EMB["Embedding model<br/>text-embedding-004"]
 
     subgraph Storage["Storage"]
         VS[("Vector Search<br/>Vertex AI")]
@@ -33,16 +35,27 @@ flowchart LR
     end
 
     subgraph App["Online app · Cloud Run"]
-        UI["Frontend<br/>Streamlit"] --> API["Backend API<br/>FastAPI"]
-        API --> RAG["RAG engine<br/>LlamaIndex"]
-        RAG <--> LLM{{"LLM<br/>Gemini / Claude"}}
-        API --> EVAL["Evaluation<br/>RAGAS · LLM judge"]
+        UI["Frontend<br/>Streamlit"] <--> API["Backend API<br/>FastAPI"]
+        API <--> RAG["RAG engine<br/>LlamaIndex"]
+        RAG <-->|"prompt + chunk text"| LLM{{"LLM<br/>Gemini / Claude"}}
+        API <-->|"scores"| EVAL["Evaluation<br/>RAGAS · LLM judge"]
+        EVAL -->|"batch: re-run each question"| RAG
+        EVAL <-->|"grade answers"| JUDGE{{"Judge LLM<br/>Gemini Flash"}}
     end
 
-    USER(("User")) --> UI
-    CHUNK --> VS & FS
-    RAG <--> VS & FS
+    BQ[("BigQuery<br/>results sink")]
+
+    USER(("User")) <--> UI
+    CHUNK -->|"leaf chunks + questions"| EMB
+    EMB -->|"vectors"| VS
+    CHUNK -->|"all nodes"| FS
+    RAG -->|"embed question"| EMB
+    RAG <-->|"nearest chunk IDs"| VS
+    RAG <-->|"chunk text"| FS
+    EVAL -.->|"disabled (commented out)"| BQ
 ```
+
+The LLM never talks to Vector Search directly. The RAG engine embeds the question, searches Vector Search, fetches the chunk text from Firestore, and only then sends that text to the LLM in the prompt. Evaluation results go back to the UI through the API and are not stored anywhere, because the BigQuery write is commented out.
 
 ### Request path (one chat question)
 
@@ -52,16 +65,26 @@ sequenceDiagram
     participant S as Streamlit
     participant F as FastAPI
     participant R as RAG engine
+    participant E as text-embedding-004
     participant D as Vector Search + Firestore
     participant G as Gemini / Claude
+    participant J as Judge LLM (RAGAS)
 
     U->>S: Ask a question
     S->>F: POST /query_rag
     F->>R: Run query
-    R->>D: Retrieve relevant chunks
-    R->>G: Generate answer from chunks
+    R->>E: Embed question
+    E-->>R: Query vector
+    R->>D: Search by vector, fetch chunk text
+    D-->>R: Relevant chunks
+    R->>G: Prompt with question + chunks
+    G-->>R: Answer
     R-->>F: Answer + sources
-    F-->>S: Answer (+ optional RAGAS scores)
+    opt Evaluate Response is ticked
+        F->>J: Score faithfulness + answer relevancy
+        J-->>F: Scores
+    end
+    F-->>S: Answer (+ scores)
     S-->>U: Show answer
 ```
 
